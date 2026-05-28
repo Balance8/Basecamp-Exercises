@@ -1,7 +1,23 @@
 !pip install -q anthropic
 
 import os
-os.environ["ANTHROPIC_API_KEY"] = "sk-ant-... "
+from pathlib import Path
+# Pull ANTHROPIC_API_KEY from the single root .env (walk up to find it),
+# or Colab secrets, or an existing env var.
+if not os.environ.get("ANTHROPIC_API_KEY"):
+    try:
+        from google.colab import userdata
+        os.environ["ANTHROPIC_API_KEY"] = userdata.get("ANTHROPIC_API_KEY")
+    except Exception:
+        for _dir in [Path.cwd(), *Path.cwd().parents]:
+            _env = _dir / ".env"
+            if _env.exists():
+                for _line in _env.read_text().splitlines():
+                    if _line.strip().startswith("ANTHROPIC_API_KEY="):
+                        os.environ["ANTHROPIC_API_KEY"] = _line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+                if os.environ.get("ANTHROPIC_API_KEY"):
+                    break
 
 import math
 from anthropic import Anthropic
@@ -415,15 +431,72 @@ tasks = [
     # ── Build tasks for these queries ──────────────────────────────────────
 
     # 1. "Price of a t-shirt?"
+    #    "t-shirt" is a hyphenated catalog key. We verify the agent passed the
+    #    exact key (not "tshirt" / "t shirt", which would KeyError on the bad specs).
+    {
+        "id": "price_tshirt",
+        "description": "Price lookup with hyphenated product name",
+        "query": "Price of a t-shirt?",
+        "category": "product_lookup",
+        "graders": [
+            {"type": "response_contains", "checks": ["24.99"]},
+            {"type": "tool_use", "checks": [{"tool_name": "get_product", "arguments": {"product": "t-shirt"}}]},
+        ],
+    },
 
     # 2. "How much for shoes?"
+    #    "shoes" is NOT in the catalog; "sneakers" (74.99) is. Designed to expose
+    #    the unimproved agent: we want it to call the tool and surface "sneakers",
+    #    not hallucinate a price for a product that doesn't exist.
+    {
+        "id": "price_shoes_synonym",
+        "description": "Synonym query: 'shoes' is not in catalog ('sneakers' is)",
+        "query": "How much for shoes?",
+        "category": "product_lookup",
+        "graders": [
+            {"type": "tool_use", "checks": [{"tool_name": "get_product"}]},
+            {"type": "response_contains", "checks": ["sneakers"]},
+        ],
+    },
 
     # 3. "3 shirts and 2 belts, what's my total?"
+    #    shirt = 29.99, belt = 24.99 -> 3*29.99 + 2*24.99 = 139.95.
+    #    Requires multiple lookups plus calculate (* then +).
+    {
+        "id": "total_shirts_belts",
+        "description": "Multi-item total requiring product lookups + calculation",
+        "query": "3 shirts and 2 belts, what's my total?",
+        "category": "multi_tool",
+        "graders": [
+            {"type": "response_numeric", "checks": [{"value": 139.95, "tolerance": 0.10}]},
+            {"type": "tool_use", "checks": [
+                {"tool_name": "get_product"},
+                {"tool_name": "calculate", "arguments": {"op": "*"}},
+                {"tool_name": "calculate", "arguments": {"op": "+"}},
+            ]},
+        ],
+    },
 
     # 4. "What's 20% off a jacket?"
+    #    jacket = 89.99, 20% off -> 89.99 * 0.80 = 71.99 (the discounted price,
+    #    which is what shoppers mean). Tolerance absorbs 71.99 vs 71.992 vs 72.00.
+    {
+        "id": "discount_jacket",
+        "description": "Calculate 20% off a jacket (lookup + percentage math)",
+        "query": "What's 20% off a jacket?",
+        "category": "calculation",
+        "graders": [
+            {"type": "response_numeric", "checks": [{"value": 71.99, "tolerance": 0.10}]},
+            {"type": "tool_use", "checks": [
+                {"tool_name": "get_product"},
+                {"tool_name": "calculate"},
+            ]},
+        ],
+    },
 
-    # 5. "What do you sell?"
-
+    # 5. "What do you sell?"  -> open-ended, can't be graded deterministically.
+    #    It's added in the LLM-as-judge cell below (Part 6), after that grader
+    #    is defined and registered.
 ]
 
 results = run_eval(run_agent, tasks)
@@ -437,47 +510,83 @@ baseline = run_eval(run_agent, tasks, num_runs=5)
 print_summary(baseline)
 
 # Implement the LLM-as-judge grader
+#
+# Deterministic graders can't score open-ended answers ("What do you sell?").
+# An LLM-as-judge reads the query + the agent's response + a criterion and
+# returns PASS/FAIL. Keep each criterion narrow so the judge evaluates one thing.
+
+JUDGE_SYSTEM_PROMPT = """You are an eval grader. You will receive:
+- The original user query
+- An AI agent's response to that query
+- A criterion to evaluate
+
+Judge whether the agent's response meets the criterion. Focus only on the
+specific criterion provided, not on overall response quality.
+
+Respond with exactly one of these on the first line:
+PASS - if the criterion is clearly met
+FAIL - if the criterion is not met or only partially met
+
+Then on the next line, give a brief reason (one sentence)."""
+
 
 def grade_llm_judge(result, check, context=None):
-    # TODO: Implement this grader
-    #
-    # Step 1: Build the judge prompt
-    #   - Include: context["query"], result["final_text"], and the check criterion
-    #   - Ask the judge to respond with PASS or FAIL on the first line, then a reason
-    #
-    # Step 2: Call Claude
-    #   - response = client.messages.create(model="claude-haiku-4-5-20241022", ...)
-    #
-    # Step 3: Parse the response
-    #   - Check if the first line contains "PASS" or "FAIL"
-    #   - Return {"score": 1.0, "reason": "..."} or {"score": 0.0, "reason": "..."}
-    pass
+    query = context["query"] if context else "Unknown query"
+    response_text = result["final_text"]
+
+    judge_prompt = f"""Original query: {query}
+
+Agent's response: {response_text}
+
+Criterion: {check}"""
+
+    try:
+        judge_response = client.messages.create(
+            model="claude-haiku-4-5",   # valid alias (the "-20241022" suffix is the retired Haiku 3.5 date)
+            max_tokens=150,
+            temperature=0.0,
+            system=JUDGE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": judge_prompt}],
+        )
+        judge_text = judge_response.content[0].text.strip()
+        first_line = judge_text.split("\n")[0].strip().upper()
+        reason = judge_text.split("\n", 1)[1].strip() if "\n" in judge_text else judge_text
+
+        if "PASS" in first_line:
+            return {"score": 1.0, "reason": f"LLM judge: {reason}"}
+        elif "FAIL" in first_line:
+            return {"score": 0.0, "reason": f"LLM judge: {reason}"}
+        else:
+            return {"score": 0.0, "reason": f"LLM judge returned unparseable response: {judge_text[:200]}"}
+    except Exception as e:
+        return {"score": 0.0, "reason": f"LLM judge error: {e}"}
 
 
 # Register it so the runner can use it
 GRADER_REGISTRY["llm_judge"] = grade_llm_judge
+print(f"Graders now available: {list(GRADER_REGISTRY.keys())}")
 
 # Add tasks that use the LLM-as-judge grader
 
 llm_judge_tasks = [
-    # {
-    #     "id": "capabilities",
-    #     "description": "Agent describes its capabilities",
-    #     "query": "What can you help me with?",
-    #     "category": "capabilities",
-    #     "graders": [
-    #         {"type": "llm_judge", "checks": [
-    #             "Response mentions the ability to look up product prices",
-    #             "Response mentions the ability to perform calculations",
-    #         ]},
-    #     ],
-    # },
+    {
+        "id": "what_do_you_sell",
+        "description": "Open-ended: agent describes available products",
+        "query": "What do you sell?",
+        "category": "capabilities",
+        "graders": [
+            {"type": "llm_judge", "checks": [
+                "Response describes or lists some of the available products in the catalog",
+                "Response is helpful and relevant to a shopping context (not dismissive or off-topic)",
+            ]},
+        ],
+    },
 ]
 
-# Run eval with both task sets
-# all_tasks = tasks + llm_judge_tasks
-# results = run_eval(run_agent, all_tasks)
-# print_summary(results)
+# Run eval with both task sets (deterministic + LLM-judged)
+all_tasks = tasks + llm_judge_tasks
+results = run_eval(run_agent, all_tasks)
+print_summary(results)
 
 # ── FACILITATOR REFERENCE: Tasks (Part 3) ────────────────────────────────────
 # Reference tasks for all five queries from Part 3, plus one LLM-as-judge task.
@@ -627,7 +736,7 @@ Criterion: {check}"""
 
     try:
         judge_response = client.messages.create(
-            model="claude-haiku-4-5-20241022",
+            model="claude-haiku-4-5",
             max_tokens=150,
             temperature=0.0,
             system=JUDGE_SYSTEM_PROMPT,

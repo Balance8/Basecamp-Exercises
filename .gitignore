@@ -1,0 +1,17 @@
+# Secrets — never commit
+.env
+.env.*
+*.env
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+.venv/
+
+# Eval / run artifacts
+eval_results/
+
+# macOS
+.DS_Store
