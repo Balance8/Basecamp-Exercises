@@ -6,7 +6,24 @@ import tabulate
 from dotenv import load_dotenv
 import os
 
-api_key = ""  # <-- Paste your API key here
+# Pull the API key from the single root .env (walk up to find it), or Colab
+# secrets, or an existing env var. Keeps the key out of the notebook.
+from pathlib import Path
+api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+if not api_key:
+    try:
+        from google.colab import userdata
+        api_key = userdata.get("ANTHROPIC_API_KEY")
+    except Exception:
+        for _dir in [Path.cwd(), *Path.cwd().parents]:
+            _env = _dir / ".env"
+            if _env.exists():
+                for _line in _env.read_text().splitlines():
+                    if _line.strip().startswith("ANTHROPIC_API_KEY="):
+                        api_key = _line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+                if api_key:
+                    break
 
 import anthropic
 
@@ -23,8 +40,7 @@ DEFAULT_MODEL = MODEL_SONNET
 
 # Health check: make a simple API call
 try:
-    response = client.messages.create(model=DEFAULT_MODEL, max_tokens=5, messages=[{"role": "user", "content":"Ping"}])
-    #TODO Basic API Claude Messages API call for health check
+    response = client.messages.create(model=DEFAULT_MODEL, max_tokens=5, messages=[{"role": "user", "content": "Ping"}])
     print(f"Health check passed: {response.content[0].text}")
     print(f"Using model: {DEFAULT_MODEL}")
 except anthropic.APIError as e:
@@ -133,13 +149,19 @@ print(f"TTFT: {ttft_ms:.0f}ms")
 print(f"TTC:  {ttc_ms:.0f}ms")
 
 def compute_otps(ttft, total_time, output_tokens):
-    # TODO: Calculate OTPS and generation time, return both
-    pass
+    # OTPS = output tokens / generation time, where generation time is the
+    # wall-clock AFTER the first token (TTC - TTFT). This isolates streaming
+    # throughput from the initial time-to-first-token latency.
+    gen_time = total_time - ttft
+    if gen_time <= 0:
+        return 0.0, gen_time
+    otps = output_tokens / gen_time
+    return otps, gen_time
 
 ttft, total_time, response = _stream_request("What is 2 + 2? Answer in one word.")
 
-tokens = 0  # TODO: Get output token count from the response usage
-otps, gen_time = 0, 0  # TODO: Use compute_otps to calculate OTPS and generation time
+tokens = response.usage.output_tokens
+otps, gen_time = compute_otps(ttft, total_time, tokens)
 
 print(f"Response: {response.content[0].text}")
 print(f"TTFT: {ttft * 1000:.0f}ms")
@@ -154,8 +176,10 @@ PRICING = {
 
 def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> tuple[float, float, float]:
     prices = PRICING.get(model, {"input": 3.00, "output": 15.00})
-    # TODO: Calculate input_cost, output_cost, and total cost from token counts and pricing
-    pass
+    # Pricing is quoted per 1,000,000 tokens.
+    input_cost = input_tokens / 1_000_000 * prices["input"]
+    output_cost = output_tokens / 1_000_000 * prices["output"]
+    return input_cost, output_cost, input_cost + output_cost
 
 ttft, total_time, response = _stream_request("What is 2 + 2? Answer in one word.")
 
@@ -223,14 +247,23 @@ print("\n" + suite.summary())
 
 import json
 
-# TODO: Define the tool schema properties
+# Calculator tool schema: an 'operation' enum plus an 'operands' array of two numbers.
 CALCULATOR_TOOL = {
     "name": "calculator",
     "description": "Performs basic arithmetic operations.",
     "input_schema": {
         "type": "object",
         "properties": {
-            # TODO: "operation" (string enum) and "operands" (array of numbers)
+            "operation": {
+                "type": "string",
+                "enum": ["add", "subtract", "multiply", "divide"],
+                "description": "The arithmetic operation to perform.",
+            },
+            "operands": {
+                "type": "array",
+                "items": {"type": "number"},
+                "description": "Exactly two numbers to operate on, e.g. [42, 17].",
+            },
         },
         "required": ["operation", "operands"]
     }
@@ -261,22 +294,43 @@ def measure_tool_use_latency(prompt: str, model: str = DEFAULT_MODEL, max_tokens
 
     start_time = time.perf_counter()
 
-    # TODO: First API call with tools=[CALCULATOR_TOOL]
-    first_response = None  # TODO
+    # First API call — let the model decide to call the calculator tool.
+    first_response = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        tools=[CALCULATOR_TOOL],
+        messages=[{"role": "user", "content": prompt}],
+    )
 
     ttft = time.perf_counter() - start_time
 
-    # TODO: Find the tool_use block in first_response.content
-    tool_use_block = None  # TODO
+    # Find the tool_use block in the first response.
+    tool_use_block = next(
+        (b for b in first_response.content if getattr(b, "type", None) == "tool_use"),
+        None,
+    )
 
     if tool_use_block is None:
         # No tool use - return early
         total_time = time.perf_counter() - start_time
         return ttft, total_time, "No tool used", first_response.usage.input_tokens, first_response.usage.output_tokens
 
-    # TODO: Execute the tool, then send the result back in a second API call
-    result = None  # TODO
-    second_response = None  # TODO
+    # Execute the tool locally, then send the result back for the final answer.
+    result = execute_calculator(**tool_use_block.input)
+    second_response = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        tools=[CALCULATOR_TOOL],
+        messages=[
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": first_response.content},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_block.id,
+                "content": str(result),
+            }]},
+        ],
+    )
 
     total_time = time.perf_counter() - start_time
 
@@ -342,13 +396,21 @@ versioning strategies, webhook design, and performance optimization.
 Always provide concrete examples with HTTP methods and status codes.
 """ * 20
 
-# TODO: Create system_block with cache_control enabled
-system_block = None  # TODO
+# A cacheable system block: identical large prefix on every call, marked ephemeral.
+system_block = [{
+    "type": "text",
+    "text": SYSTEM_PROMPT,
+    "cache_control": {"type": "ephemeral"},
+}]
 
-# TODO: Make an API call using system=system_block
 def cached_request(question):
     start = time.perf_counter()
-    response = None  # TODO
+    response = client.messages.create(
+        model=DEFAULT_MODEL,
+        max_tokens=256,
+        system=system_block,
+        messages=[{"role": "user", "content": question}],
+    )
     elapsed = time.perf_counter() - start
     return response, elapsed
 
@@ -382,10 +444,14 @@ def chat(messages, new_question):
         if msg["role"] == "assistant" and isinstance(msg["content"], list):
             msg["content"] = msg["content"][0]["text"]
 
-    # TODO: Add cache_control to the last assistant message (if any)
-    # Hint: Convert content to [{"type": "text", "text": ..., "cache_control": {"type": "ephemeral"}}]
+    # Mark the most recent assistant turn as the cache breakpoint so the whole
+    # conversation prefix up to here is cached and re-read cheaply next turn.
     if messages and messages[-1]["role"] == "assistant":
-        pass  # Add cache_control here
+        messages[-1]["content"] = [{
+            "type": "text",
+            "text": messages[-1]["content"],
+            "cache_control": {"type": "ephemeral"},
+        }]
 
     messages.append({"role": "user", "content": new_question})
 
